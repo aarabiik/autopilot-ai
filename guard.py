@@ -122,6 +122,16 @@ def resolve_path(value: str, settings: dict[str, Any]) -> tuple[Path, bool]:
         return resolved, False
 
 
+def outside_level(settings: dict[str, Any]) -> str:
+    """Уровень для путей вне рабочей папки.
+
+    По умолчанию (allow_outside = True) работа с другими папками разрешена
+    без предупреждения — это обычный «changing». Если пользователь выключил
+    allow_outside, такие действия снова требуют подтверждения.
+    """
+    return "changing" if settings.get("allow_outside", True) else "dangerous"
+
+
 def _forbidden_patterns(settings: dict[str, Any]) -> list[str]:
     extra = settings.get("forbidden_patterns") or []
     if isinstance(extra, str):
@@ -171,9 +181,9 @@ def classify_command(command: str, settings: dict[str, Any]) -> Verdict:
                 break
 
     outside = _outside_paths(text, settings)
-    if outside:
+    if outside and level != "dangerous":
         return Verdict(
-            "dangerous" if level != "dangerous" else "dangerous",
+            outside_level(settings),
             "обращение за пределы рабочей папки: " + ", ".join(outside[:3]),
         )
 
@@ -251,15 +261,19 @@ def classify_tool(name: str, args: dict[str, Any], settings: dict[str, Any]) -> 
             cwd = str(args.get("cwd") or "").strip()
             if cwd:
                 _, inside = resolve_path(cwd, settings)
-                if not inside:
-                    return Verdict("dangerous", "рабочий каталог вне разрешённой папки")
+                if not inside and verdict.level != "dangerous":
+                    return Verdict(
+                        outside_level(settings), "рабочий каталог вне рабочей папки"
+                    )
             return verdict
         if name in {"start_session", "send_input"}:
             cwd = str(args.get("cwd") or "").strip()
             if cwd:
                 _, inside = resolve_path(cwd, settings)
                 if not inside:
-                    return Verdict("dangerous", "рабочий каталог вне разрешённой папки")
+                    return Verdict(
+                        outside_level(settings), "рабочий каталог вне рабочей папки"
+                    )
             return Verdict("changing", "интерактивная сессия")
         if name == "gh":
             return classify_gh(args.get("args", ""), settings)
@@ -284,7 +298,7 @@ def classify_tool(name: str, args: dict[str, Any], settings: dict[str, Any]) -> 
                 _, inside_dst = resolve_path(str(args.get("dst", "")), settings)
                 inside = inside and inside_dst
             if not inside:
-                return Verdict("dangerous", "путь вне рабочей папки")
+                return Verdict(outside_level(settings), "путь вне рабочей папки")
             if name in {"read_file", "list_dir", "grep", "glob"}:
                 return Verdict("safe", "")
             if name == "delete_file":

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""AutoPilot AI — чат с нейросетью, которая управляет мышью и клавиатурой.
+"""JARVIS — чат с нейросетью, которая управляет мышью и клавиатурой.
 
-Приложение всегда на виду (режим «поверх всех окон»), показывает координаты
-курсора и даёт модели инструменты: клики, ввод текста, горячие клавиши,
-прокрутка и именованные точки экрана.
+Два режима: полный (космическое окно с чатом) и мини — маленькая плавающая
+панель поверх экрана, как ассистент в телефоне. Модель получает инструменты:
+клики, ввод текста, горячие клавиши, прокрутка и именованные точки экрана.
 
 Запуск:  python app.py
 """
@@ -31,14 +31,16 @@ import files
 import github
 import guard
 import llm
+import overlay
 import screen
 import shell
+import theme
 import uia
 import workspace
 from llm import Agent, LLMError
 
-APP_NAME = "AutoPilot AI"
-VERSION = "1.0"
+APP_NAME = "JARVIS"
+VERSION = "2.0"
 APP_DIR = Path(__file__).resolve().parent
 SETTINGS_PATH = APP_DIR / "settings.json"
 POINTS_PATH = APP_DIR / "points.json"
@@ -84,6 +86,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
     "always_on_top": True,
     "confirm_mode": False,
     "minimize_before_typing": True,
+    "allow_outside": True,
 }
 
 
@@ -151,6 +154,9 @@ class SettingsDialog(tk.Toplevel):
             "minimize_before_typing": tk.BooleanVar(
                 value=bool(settings.get("minimize_before_typing", True))
             ),
+            "allow_outside": tk.BooleanVar(
+                value=bool(settings.get("allow_outside", True))
+            ),
         }
 
         rows = [
@@ -164,8 +170,7 @@ class SettingsDialog(tk.Toplevel):
                                           "число — сколько действий подряд за один запрос"),
             ("Лимит времени, с", "max_seconds", "0 — без ограничения; иначе задача\n"
                                                 "прерывается по времени"),
-            ("Рабочая папка", "work_dir", "команды и файлы по умолчанию;\n"
-                                          "выход за её пределы — с подтверждением"),
+            ("Рабочая папка", "work_dir", "папка по умолчанию для команд и файлов"),
             ("Запрещённые команды", "forbidden_patterns", "регулярные выражения через ;\n"
                                                           "такие команды не выполняются никогда"),
             ("Температура", "temperature", "0 — предсказуемо, 1 — креативно"),
@@ -196,10 +201,15 @@ class SettingsDialog(tk.Toplevel):
             body,
             text="Сворачивать окно перед вводом текста",
             variable=self.vars["minimize_before_typing"],
-        ).grid(row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=(2, 10))
+        ).grid(row=len(rows) + 1, column=0, columnspan=3, sticky="w", pady=(2, 2))
+        ttk.Checkbutton(
+            body,
+            text="Работать с файлами вне рабочей папки без предупреждения",
+            variable=self.vars["allow_outside"],
+        ).grid(row=len(rows) + 2, column=0, columnspan=3, sticky="w", pady=(2, 10))
 
         buttons = ttk.Frame(body)
-        buttons.grid(row=len(rows) + 2, column=0, columnspan=3, sticky="ew", pady=(8, 0))
+        buttons.grid(row=len(rows) + 3, column=0, columnspan=3, sticky="ew", pady=(8, 0))
         ttk.Button(buttons, text="Проверить подключение", command=self._test).pack(
             side="left"
         )
@@ -227,6 +237,7 @@ class SettingsDialog(tk.Toplevel):
             "temperature": float(str(self.vars["temperature"].get()).replace(",", ".")),
             "vision": bool(self.vars["vision"].get()),
             "minimize_before_typing": bool(self.vars["minimize_before_typing"].get()),
+            "allow_outside": bool(self.vars["allow_outside"].get()),
         }
 
     def _show_models(self, models: list[str]) -> None:
@@ -407,7 +418,7 @@ class HistoryDialog(tk.Toplevel):
         self.destroy()
 
 
-class AutoPilotAI:
+class JarvisApp:
     def __init__(self, root: tk.Tk) -> None:
         self.root = root
         self.settings = self._load_settings()
@@ -424,6 +435,7 @@ class AutoPilotAI:
         except Exception:  # noqa: BLE001
             pass
         self.worker: threading.Thread | None = None
+        self.mini: overlay.MiniOverlay | None = None
         self._turn_started = 0.0
         self._closed = False
         self._poll_job: str | None = None
@@ -471,111 +483,206 @@ class AutoPilotAI:
 
     # -- интерфейс ---------------------------------------------------------
     def _build_ui(self) -> None:
-        style = ttk.Style()
-        for theme in ("vista", "clam"):
-            try:
-                style.theme_use(theme)
-                break
-            except tk.TclError:
-                continue
+        theme.apply(self.root)
 
         self.root.title(f"{APP_NAME} {VERSION}")
-        self.root.geometry("760x640")
-        self.root.minsize(620, 480)
+        self.root.geometry("820x680")
+        self.root.minsize(640, 500)
+        self.root.configure(bg=theme.BG)
         self.root.attributes("-topmost", bool(self.settings.get("always_on_top", True)))
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
-        top = ttk.Frame(self.root, padding=(10, 8, 10, 4))
+        # -- шапка: реактор, название, кнопки ------------------------------
+        top = tk.Frame(self.root, bg=theme.PANEL, padx=12, pady=8)
         top.grid(row=0, column=0, sticky="ew")
 
-        ttk.Button(top, text="Настройки", command=self.open_settings).pack(side="left")
-        ttk.Button(top, text="Точки", command=self.open_points).pack(
-            side="left", padx=(6, 0)
+        self.logo = tk.Canvas(
+            top, width=34, height=34, bg=theme.PANEL, highlightthickness=0
         )
-        ttk.Button(top, text="Файлы", command=self.open_files).pack(
-            side="left", padx=(6, 0)
-        )
-        ttk.Button(top, text="GitHub", command=self.open_github).pack(
-            side="left", padx=(6, 0)
-        )
-        ttk.Button(top, text="История", command=self.open_history).pack(
-            side="left", padx=(6, 0)
-        )
-        ttk.Button(top, text="Новый диалог", command=self.new_dialog).pack(
-            side="left", padx=(6, 0)
-        )
-        ttk.Button(top, text="■ Стоп (F12)", command=self.stop).pack(
-            side="left", padx=(6, 0)
-        )
+        self.logo.pack(side="left", padx=(0, 10))
+        self._logo_phase = 0.0
+        self._draw_logo()
 
-        self.topmost_var = tk.BooleanVar(
-            value=bool(self.settings.get("always_on_top", True))
+        title_box = tk.Frame(top, bg=theme.PANEL)
+        title_box.pack(side="left")
+        tk.Label(
+            title_box,
+            text=APP_NAME,
+            bg=theme.PANEL,
+            fg=theme.ACCENT,
+            font=("Segoe UI Semibold", 13),
+        ).pack(anchor="w")
+        self.model_label = tk.Label(
+            title_box, text="", bg=theme.PANEL, fg=theme.MUTED, font=theme.FONT_SMALL
         )
-        ttk.Checkbutton(
-            top, text="Поверх окон", variable=self.topmost_var, command=self._toggle_topmost
-        ).pack(side="left", padx=(16, 0))
-
-        self.confirm_var = tk.BooleanVar(
-            value=bool(self.settings.get("confirm_mode", True))
-        )
-        ttk.Checkbutton(
-            top,
-            text="Спрашивать перед действием",
-            variable=self.confirm_var,
-            command=self._toggle_confirm,
-        ).pack(side="left", padx=(12, 0))
-
-        self.model_label = ttk.Label(top, text="", foreground="#666")
-        self.model_label.pack(side="right")
+        self.model_label.pack(anchor="w")
         self._refresh_model_label()
 
-        chat_frame = ttk.Frame(self.root, padding=(10, 0))
+        right = tk.Frame(top, bg=theme.PANEL)
+        right.pack(side="right")
+
+        self.mini_btn = theme.button(right, "◱ Мини", self.enter_mini_mode, accent=True)
+        self.mini_btn.pack(side="right", padx=(6, 0))
+        theme.button(right, "■ Стоп", self.stop).pack(side="right", padx=(6, 0))
+        theme.button(right, "Новый", self.new_dialog).pack(side="right", padx=(6, 0))
+        theme.button(right, "История", self.open_history).pack(side="right", padx=(6, 0))
+        theme.button(right, "GitHub", self.open_github).pack(side="right", padx=(6, 0))
+        theme.button(right, "Файлы", self.open_files).pack(side="right", padx=(6, 0))
+        theme.button(right, "Точки", self.open_points).pack(side="right", padx=(6, 0))
+        theme.button(right, "⚙", self.open_settings).pack(side="right", padx=(6, 0))
+
+        # -- чат -----------------------------------------------------------
+        chat_frame = tk.Frame(self.root, bg=theme.BG, padx=12, pady=10)
         chat_frame.grid(row=1, column=0, sticky="nsew")
         chat_frame.columnconfigure(0, weight=1)
         chat_frame.rowconfigure(0, weight=1)
 
         self.chat = tk.Text(
-            chat_frame, wrap="word", state="disabled", font=("Segoe UI", 10)
+            chat_frame,
+            wrap="word",
+            state="disabled",
+            font=theme.FONT,
+            bg=theme.CHAT_BG,
+            fg=theme.TEXT,
+            insertbackground=theme.ACCENT,
+            selectbackground=theme.SELECT,
+            selectforeground=theme.TEXT,
+            bd=0,
+            relief="flat",
+            padx=14,
+            pady=12,
+            highlightthickness=1,
+            highlightbackground=theme.BORDER,
+            highlightcolor=theme.ACCENT_DIM,
+            spacing1=2,
+            spacing3=2,
         )
         self.chat.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(chat_frame, command=self.chat.yview)
-        scrollbar.grid(row=0, column=1, sticky="ns")
+        scrollbar = ttk.Scrollbar(
+            chat_frame,
+            command=self.chat.yview,
+            style="Jarvis.Vertical.TScrollbar",
+        )
+        scrollbar.grid(row=0, column=1, sticky="ns", padx=(6, 0))
         self.chat.configure(yscrollcommand=scrollbar.set)
-        self.chat.tag_configure("user", foreground="#1a4f9c", spacing1=6, spacing3=2)
-        self.chat.tag_configure("assistant", foreground="#111111", spacing1=6, spacing3=4)
-        self.chat.tag_configure("tool", foreground="#6a6a6a", font=("Consolas", 9))
-        self.chat.tag_configure("result", foreground="#8a8a8a", font=("Consolas", 9))
-        self.chat.tag_configure("warn", foreground="#b06000")
-        self.chat.tag_configure("error", foreground="#b00020")
+        self.chat.tag_configure(
+            "user", foreground=theme.USER, font=("Segoe UI Semibold", 10),
+            spacing1=10, spacing3=2,
+        )
+        self.chat.tag_configure("assistant", foreground=theme.TEXT, spacing1=8, spacing3=6)
+        self.chat.tag_configure("tool", foreground=theme.TOOL, font=theme.FONT_MONO)
+        self.chat.tag_configure("result", foreground=theme.RESULT, font=theme.FONT_MONO)
+        self.chat.tag_configure("warn", foreground=theme.WARN)
+        self.chat.tag_configure("error", foreground=theme.ERROR)
 
-        bottom = ttk.Frame(self.root, padding=10)
+        # -- поле ввода ----------------------------------------------------
+        bottom = tk.Frame(self.root, bg=theme.BG, padx=12, pady=8)
         bottom.grid(row=2, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
 
-        self.input_var = tk.StringVar()
-        self.entry = ttk.Entry(bottom, textvariable=self.input_var, font=("Segoe UI", 10))
-        self.entry.grid(row=0, column=0, sticky="ew")
-        self.entry.bind("<Return>", lambda _event: self.send())
-        self.send_btn = ttk.Button(bottom, text="Отправить", command=self.send)
-        self.send_btn.grid(row=0, column=1, padx=(8, 0))
+        entry_wrap = tk.Frame(
+            bottom, bg=theme.INPUT_BG, highlightthickness=1,
+            highlightbackground=theme.BORDER, highlightcolor=theme.ACCENT_DIM,
+        )
+        entry_wrap.grid(row=0, column=0, sticky="ew")
+        entry_wrap.columnconfigure(0, weight=1)
 
+        self.input_var = tk.StringVar()
+        self.entry = tk.Entry(
+            entry_wrap,
+            textvariable=self.input_var,
+            font=theme.FONT,
+            bg=theme.INPUT_BG,
+            fg=theme.TEXT,
+            insertbackground=theme.ACCENT,
+            bd=0,
+            relief="flat",
+            highlightthickness=0,
+        )
+        self.entry.grid(row=0, column=0, sticky="ew", padx=12, pady=9)
+        self.entry.bind("<Return>", lambda _event: self.send())
+        self.send_btn = theme.button(bottom, "Отправить ➤", self.send, accent=True)
+        self.send_btn.grid(row=0, column=1, padx=(8, 0), ipady=4)
+
+        # -- статус --------------------------------------------------------
         self.status_var = tk.StringVar(value="Готов.")
-        status = ttk.Label(
+        status = tk.Label(
             self.root,
             textvariable=self.status_var,
             anchor="w",
-            relief="sunken",
-            padding=(8, 4),
+            bg=theme.PANEL,
+            fg=theme.MUTED,
+            font=theme.FONT_SMALL,
+            padx=12,
+            pady=4,
         )
         status.grid(row=3, column=0, sticky="ew")
 
         self._append(
             "assistant",
-            "Привет! Я AutoPilot — двигаю мышь, кликаю, печатаю и нажимаю клавиши.\n\n"
-            "F8 — сохранить точку под курсором, F12 — стоп. История чатов "
-            "сохраняется автоматически (кнопка «История»).",
+            "Привет. Я JARVIS — управляю мышью, клавиатурой, консолью и файлами.\n\n"
+            "◱ Мини — компактный режим поверх экрана (Ctrl+Shift+J).\n"
+            "F8 — сохранить точку под курсором, F12 — стоп.",
         )
+
+    # -- логотип-реактор ---------------------------------------------------
+    def _draw_logo(self) -> None:
+        import math
+
+        canvas = self.logo
+        canvas.delete("all")
+        self._logo_phase = (self._logo_phase + 0.12) % (2 * math.pi)
+        pulse = 0.5 + 0.5 * math.sin(self._logo_phase)
+        cx = cy = 17
+        for ring in (15, 11):
+            color = theme.blend(theme.ACCENT_DARK, theme.ACCENT, 0.3 + 0.4 * pulse)
+            canvas.create_oval(
+                cx - ring, cy - ring, cx + ring, cy + ring, outline=color, width=1
+            )
+        canvas.create_oval(
+            cx - 6, cy - 6, cx + 6, cy + 6,
+            outline=theme.blend(theme.ACCENT, "#ffffff", 0.3 * pulse), width=2,
+        )
+        canvas.create_oval(
+            cx - 2, cy - 2, cx + 2, cy + 2,
+            fill=theme.blend(theme.ACCENT, "#ffffff", 0.4 + 0.4 * pulse), outline="",
+        )
+        self._logo_job = self.root.after(60, self._draw_logo)
+
+    # -- режимы: полный и мини --------------------------------------------
+    def enter_mini_mode(self) -> None:
+        """Свернуть полное окно и показать плавающую мини-панель."""
+        if getattr(self, "mini", None) is not None:
+            self.mini.focus_input()
+            return
+        self.root.withdraw()
+        self.mini = overlay.MiniOverlay(
+            self.root,
+            on_send=self._mini_send,
+            on_expand=self.exit_mini_mode,
+            on_close=self.exit_mini_mode,
+        )
+        busy = self.worker is not None and self.worker.is_alive()
+        self.mini.set_busy(busy)
+        self.mini.focus_input()
+
+    def exit_mini_mode(self) -> None:
+        """Закрыть мини-панель и вернуть полное окно."""
+        mini = getattr(self, "mini", None)
+        if mini is not None:
+            self.mini = None
+            try:
+                mini.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+        self.root.deiconify()
+        self.root.lift()
+        self.entry.focus_set()
+
+    def _mini_send(self, text: str) -> None:
+        self.input_var.set(text)
+        self.send()
 
     def _append(self, tag: str, text: str) -> None:
         self.chat.configure(state="normal")
@@ -849,7 +956,7 @@ class AutoPilotAI:
                     args = str(function.get("arguments", ""))[:80]
                     self._append("tool", f"  ⚙ {function.get('name', '')}({args})")
                 if text:
-                    self._append("assistant", "AutoPilot: " + text)
+                    self._append("assistant", "JARVIS: " + text)
             elif role == "tool":
                 self._append("result", "    ↳ " + text[:400])
 
@@ -857,7 +964,7 @@ class AutoPilotAI:
     def _make_title(messages: list[dict[str, Any]]) -> str:
         for message in messages:
             if message.get("role") == "user":
-                text = AutoPilotAI._content_text(message.get("content")).strip()
+                text = JarvisApp._content_text(message.get("content")).strip()
                 if text:
                     return text[:50]
         return "Без названия"
@@ -895,6 +1002,8 @@ class AutoPilotAI:
         self.stop_event.clear()
         self._turn_started = time.time()
         self.send_btn.configure(state="disabled")
+        if self.mini is not None:
+            self.mini.set_busy(True)
         self.status_var.set("Думаю…")
         self.worker = threading.Thread(target=self._turn, args=(text,), daemon=True)
         self.worker.start()
@@ -937,14 +1046,21 @@ class AutoPilotAI:
                         self.stop()
                     elif text == "point":
                         self._quick_point()
+                    elif text == "mini":
+                        if self.mini is None:
+                            self.enter_mini_mode()
+                        else:
+                            self.exit_mini_mode()
                     continue
                 if kind == "idle":
                     self.send_btn.configure(state="normal")
                     self.status_var.set("Готов.")
+                    if self.mini is not None:
+                        self.mini.set_busy(False)
                     self._save_session()
                     continue
                 if kind == "assistant":
-                    self._append("assistant", "AutoPilot: " + text)
+                    self._append("assistant", "JARVIS: " + text)
                 elif kind == "user":
                     self._append("user", text)
                 elif kind == "tool":
@@ -981,6 +1097,7 @@ class AutoPilotAI:
             {
                 "<f12>": lambda: self.events.put(("hotkey", "stop")),
                 "<f8>": lambda: self.events.put(("hotkey", "point")),
+                "<ctrl>+<shift>+j": lambda: self.events.put(("hotkey", "mini")),
             }
         )
         self._hotkeys.daemon = True
@@ -1691,6 +1808,16 @@ class AutoPilotAI:
             return
         self._closed = True
         self._save_session()
+        if getattr(self, "mini", None) is not None:
+            try:
+                self.mini.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+            self.mini = None
+        try:
+            self.root.after_cancel(self._logo_job)
+        except Exception:  # noqa: BLE001
+            pass
         self.stop_event.set()
         actions.release_all()
         try:
@@ -1730,7 +1857,7 @@ def main() -> None:
         args.exc_type, args.exc_value, args.exc_traceback
     )
     root = tk.Tk()
-    app = AutoPilotAI(root)
+    app = JarvisApp(root)
     root.report_callback_exception = _log_crash
     if "--selftest" in sys.argv:
         root.after(1500, app.shutdown)
