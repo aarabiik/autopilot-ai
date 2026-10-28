@@ -20,6 +20,10 @@ SM_YVIRTUALSCREEN = 77
 # Одно HTTP-соединение на все запросы к vision-модели.
 _SESSION = requests.Session()
 
+# Модель по умолчанию для look_screen. glm-5.3-flash на этом провайдере
+# уходит в reasoning и возвращает пустой content, поэтому по умолчанию qwen.
+DEFAULT_VISION_MODEL = "qwen/qwen3.8-27b"
+
 
 class RECT(ctypes.Structure):
     _fields_ = [
@@ -442,8 +446,12 @@ def describe(
     приложение успевает вернуть своё окно и не висит спрятанным, пока
     vision-модель думает.
     """
-    model = str(settings.get("vision_model") or "zai-org/glm-5.3-flash").strip()
-    base_url = str(settings.get("base_url", "")).strip().rstrip("/")
+    model = str(settings.get("vision_model") or DEFAULT_VISION_MODEL).strip()
+    # У зрения может быть свой провайдер: например, основная модель через
+    # OpenRouter, а картинки — через Munito. Пустое поле = общий Base URL.
+    base_url = str(
+        settings.get("vision_base_url") or settings.get("base_url", "")
+    ).strip().rstrip("/")
     if not base_url:
         raise RuntimeError("Не задан Base URL в настройках.")
 
@@ -550,7 +558,9 @@ def describe(
     if effort:
         payload["reasoning_effort"] = effort
     headers = {"Content-Type": "application/json"}
-    key = str(settings.get("api_key", "")).strip()
+    key = str(
+        settings.get("vision_api_key") or settings.get("api_key", "")
+    ).strip()
     if key:
         headers["Authorization"] = f"Bearer {key}"
 
@@ -558,28 +568,27 @@ def describe(
     for max_tokens in token_steps:
         payload["max_tokens"] = max_tokens
         response = None
-        for attempt in range(3):
+        for attempt in range(4):
             try:
                 response = _SESSION.post(
                     base_url + "/chat/completions",
                     headers=headers,
                     json=payload,
-                    timeout=(10, 60),
+                    timeout=(10, 90),
                 )
             except requests.RequestException as exc:
-                if attempt < 2:
-                    time.sleep(0.8)
+                if attempt < 3:
+                    time.sleep(1.0 * (attempt + 1))
                     continue
                 raise RuntimeError(
                     f"vision-модель {model}: сеть недоступна ({exc})."
                 ) from exc
             if response.status_code < 400:
                 break
-            # Провайдер изредка отвечает 400 «body must be valid JSON» на
-            # корректное тело — повтор помогает.
-            transient = response.status_code == 400 and "valid JSON" in response.text
-            if transient and attempt < 2:
-                time.sleep(0.8)
+            # Перегрузка провайдера и «body must be valid JSON» — временные.
+            transient = response.status_code in (400, 429, 500, 502, 503, 504)
+            if transient and attempt < 3:
+                time.sleep(min(1.5 * (attempt + 1), 6.0))
                 continue
             raise RuntimeError(
                 f"vision-модель {model} вернула HTTP {response.status_code}: "
@@ -588,7 +597,8 @@ def describe(
         data = response.json()
         try:
             choice = data["choices"][0]
-            content = str(choice["message"].get("content") or "").strip()
+            message = choice["message"]
+            content = str(message.get("content") or "").strip()
             finish = choice.get("finish_reason")
         except (KeyError, IndexError, TypeError) as exc:
             raise RuntimeError(
@@ -596,6 +606,11 @@ def describe(
             ) from exc
         if content:
             return content
+        # Некоторые модели (glm, qwen) кладут весь ответ в reasoning,
+        # а content оставляют пустым — это тоже валидный результат.
+        reasoning = str(message.get("reasoning") or "").strip()
+        if reasoning:
+            return reasoning
         last_note = (
             "Модель израсходовала лимит на рассуждения и не вернула текст "
             f"(finish_reason={finish}). Попробуйте другую vision-модель "

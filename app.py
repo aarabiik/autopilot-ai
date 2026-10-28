@@ -27,6 +27,7 @@ from typing import Any, Callable
 
 import actions
 import chatstore
+import chatview
 import files
 import github
 import guard
@@ -72,8 +73,10 @@ def _extract_coords(text: str) -> tuple[int, int] | None:
 DEFAULT_SETTINGS: dict[str, Any] = {
     "base_url": "https://api.openai.com/v1",
     "api_key": "",
-    "model": "deepseek-ai/deepseek-v4.1-flash-1017",
-    "vision_model": "zai-org/glm-5.3-flash",
+    "model": "deepseek-ai/deepseek-v4-flash",
+    "vision_model": "qwen/qwen3.8-27b",
+    "vision_base_url": "",
+    "vision_api_key": "",
     "reasoning_effort": "",
     "vision": False,
     "max_steps": 0,
@@ -138,7 +141,13 @@ class SettingsDialog(tk.Toplevel):
             "api_key": tk.StringVar(value=str(settings.get("api_key", ""))),
             "model": tk.StringVar(value=str(settings.get("model", ""))),
             "vision_model": tk.StringVar(
-                value=str(settings.get("vision_model", "zai-org/glm-5.3-flash"))
+                value=str(settings.get("vision_model", "qwen/qwen3.8-27b"))
+            ),
+            "vision_base_url": tk.StringVar(
+                value=str(settings.get("vision_base_url", ""))
+            ),
+            "vision_api_key": tk.StringVar(
+                value=str(settings.get("vision_api_key", ""))
             ),
             "max_steps": tk.StringVar(value=str(settings.get("max_steps", 0))),
             "max_seconds": tk.StringVar(value=str(settings.get("max_seconds", 1800))),
@@ -165,7 +174,11 @@ class SettingsDialog(tk.Toplevel):
             ("API-ключ", "api_key", "можно оставить пустым для локальной Ollama"),
             ("Модель", "model", "например gpt-4o-mini, llama3.1, qwen2.5:7b"),
             ("Vision-модель", "vision_model", "модель для look_screen, видит скриншоты:\n"
-                                              "zai-org/glm-5.3-flash, qwen/qwen3.8-27b"),
+                                              "qwen/qwen3.8-27b (рабочая),\n"
+                                              "zai-org/glm-5.3-flash (часто пустой ответ)"),
+            ("Vision Base URL", "vision_base_url", "свой провайдер для картинок;\n"
+                                                   "пусто — как у основной модели"),
+            ("Vision API-ключ", "vision_api_key", "пусто — ключ основной модели"),
             ("Лимит шагов", "max_steps", "0 — без ограничения;\n"
                                           "число — сколько действий подряд за один запрос"),
             ("Лимит времени, с", "max_seconds", "0 — без ограничения; иначе задача\n"
@@ -188,7 +201,7 @@ class SettingsDialog(tk.Toplevel):
                 ttk.Entry(body, textvariable=self.vars[key], width=42).grid(
                     row=index, column=1, sticky="ew", padx=(10, 0), pady=6
                 )
-            ttk.Label(body, text=hint, foreground="#666", justify="left").grid(
+            ttk.Label(body, text=hint, foreground=theme.MUTED, justify="left").grid(
                 row=index, column=2, sticky="w", padx=(10, 0)
             )
 
@@ -229,6 +242,8 @@ class SettingsDialog(tk.Toplevel):
             "api_key": str(self.vars["api_key"].get()).strip(),
             "model": str(self.vars["model"].get()).strip(),
             "vision_model": str(self.vars["vision_model"].get()).strip(),
+            "vision_base_url": str(self.vars["vision_base_url"].get()).strip(),
+            "vision_api_key": str(self.vars["vision_api_key"].get()).strip(),
             "max_steps": max(0, int(float(self.vars["max_steps"].get() or 0))),
             "max_seconds": max(0, int(float(self.vars["max_seconds"].get() or 0))),
             "work_dir": str(self.vars["work_dir"].get()).strip(),
@@ -283,7 +298,7 @@ class PointsDialog(tk.Toplevel):
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
 
-        self.listbox = tk.Listbox(body, width=48, height=14)
+        self.listbox = theme.listbox(body, width=48, height=14)
         self.listbox.pack(fill="both", expand=True)
         self.listbox.bind("<Double-Button-1>", lambda _e: self._click_selected())
 
@@ -301,7 +316,7 @@ class PointsDialog(tk.Toplevel):
         ttk.Label(
             body,
             text="F8 в главном окне — быстро сохранить точку под курсором.",
-            foreground="#666",
+            foreground=theme.MUTED,
         ).pack(anchor="w", pady=(6, 0))
         self.refresh()
 
@@ -360,7 +375,7 @@ class HistoryDialog(tk.Toplevel):
         body = ttk.Frame(self, padding=12)
         body.pack(fill="both", expand=True)
 
-        self.listbox = tk.Listbox(body, width=64, height=16)
+        self.listbox = theme.listbox(body, width=64, height=16)
         self.listbox.pack(fill="both", expand=True)
         self.listbox.bind("<Double-Button-1>", lambda _event: self._open())
 
@@ -376,7 +391,7 @@ class HistoryDialog(tk.Toplevel):
         ttk.Label(
             body,
             text="Чаты сохраняются автоматически после каждого ответа.",
-            foreground="#666",
+            foreground=theme.MUTED,
         ).pack(anchor="w", pady=(6, 0))
         self.refresh()
 
@@ -486,21 +501,21 @@ class JarvisApp:
         theme.apply(self.root)
 
         self.root.title(f"{APP_NAME} {VERSION}")
-        self.root.geometry("820x680")
-        self.root.minsize(640, 500)
+        self.root.geometry("980x760")
+        self.root.minsize(720, 560)
         self.root.configure(bg=theme.BG)
         self.root.attributes("-topmost", bool(self.settings.get("always_on_top", True)))
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(1, weight=1)
 
         # -- шапка: реактор, название, кнопки ------------------------------
-        top = tk.Frame(self.root, bg=theme.PANEL, padx=12, pady=8)
+        top = tk.Frame(self.root, bg=theme.PANEL, padx=18, pady=14)
         top.grid(row=0, column=0, sticky="ew")
 
         self.logo = tk.Canvas(
-            top, width=34, height=34, bg=theme.PANEL, highlightthickness=0
+            top, width=44, height=44, bg=theme.PANEL, highlightthickness=0
         )
-        self.logo.pack(side="left", padx=(0, 10))
+        self.logo.pack(side="left", padx=(0, 14))
         self._logo_phase = 0.0
         self._draw_logo()
 
@@ -510,80 +525,63 @@ class JarvisApp:
             title_box,
             text=APP_NAME,
             bg=theme.PANEL,
-            fg=theme.ACCENT,
-            font=("Segoe UI Semibold", 13),
+            fg=theme.TEXT,
+            font=theme.FONT_BRAND,
         ).pack(anchor="w")
         self.model_label = tk.Label(
             title_box, text="", bg=theme.PANEL, fg=theme.MUTED, font=theme.FONT_SMALL
         )
-        self.model_label.pack(anchor="w")
+        self.model_label.pack(anchor="w", pady=(2, 0))
         self._refresh_model_label()
 
         right = tk.Frame(top, bg=theme.PANEL)
         right.pack(side="right")
 
         self.mini_btn = theme.button(right, "◱ Мини", self.enter_mini_mode, accent=True)
-        self.mini_btn.pack(side="right", padx=(6, 0))
-        theme.button(right, "■ Стоп", self.stop).pack(side="right", padx=(6, 0))
-        theme.button(right, "Новый", self.new_dialog).pack(side="right", padx=(6, 0))
-        theme.button(right, "История", self.open_history).pack(side="right", padx=(6, 0))
-        theme.button(right, "GitHub", self.open_github).pack(side="right", padx=(6, 0))
-        theme.button(right, "Файлы", self.open_files).pack(side="right", padx=(6, 0))
-        theme.button(right, "Точки", self.open_points).pack(side="right", padx=(6, 0))
-        theme.button(right, "⚙", self.open_settings).pack(side="right", padx=(6, 0))
+        self.mini_btn.pack(side="right", padx=(8, 0))
+        theme.button(right, "■ Стоп", self.stop).pack(side="right", padx=(8, 0))
+        theme.button(right, "Новый", self.new_dialog).pack(side="right", padx=(8, 0))
+        theme.button(right, "История", self.open_history).pack(side="right", padx=(8, 0))
+        theme.button(right, "GitHub", self.open_github).pack(side="right", padx=(8, 0))
+        theme.button(right, "Файлы", self.open_files).pack(side="right", padx=(8, 0))
+        theme.button(right, "Точки", self.open_points).pack(side="right", padx=(8, 0))
+        theme.button(right, "⚙", self.open_settings).pack(side="right", padx=(8, 0))
+
+        # тонкая светящаяся линия под шапкой
+        edge = tk.Canvas(self.root, height=2, bg=theme.PANEL, highlightthickness=0)
+        edge.grid(row=0, column=0, sticky="sew")
+        def _paint_edge(event) -> None:
+            edge.delete("all")
+            half = max(2, event.width // 2)
+            theme.gradient(
+                edge, 0, 0, half, 2,
+                theme.PANEL, theme.ACCENT, steps=60, horizontal=True,
+            )
+            theme.gradient(
+                edge, half, 0, event.width, 2,
+                theme.ACCENT, theme.PANEL, steps=60, horizontal=True,
+            )
+
+        edge.bind("<Configure>", _paint_edge)
 
         # -- чат -----------------------------------------------------------
-        chat_frame = tk.Frame(self.root, bg=theme.BG, padx=12, pady=10)
+        chat_frame = tk.Frame(self.root, bg=theme.BG, padx=14, pady=12)
         chat_frame.grid(row=1, column=0, sticky="nsew")
         chat_frame.columnconfigure(0, weight=1)
         chat_frame.rowconfigure(0, weight=1)
 
-        self.chat = tk.Text(
-            chat_frame,
-            wrap="word",
-            state="disabled",
-            font=theme.FONT,
-            bg=theme.CHAT_BG,
-            fg=theme.TEXT,
-            insertbackground=theme.ACCENT,
-            selectbackground=theme.SELECT,
-            selectforeground=theme.TEXT,
-            bd=0,
-            relief="flat",
-            padx=14,
-            pady=12,
-            highlightthickness=1,
-            highlightbackground=theme.BORDER,
-            highlightcolor=theme.ACCENT_DIM,
-            spacing1=2,
-            spacing3=2,
-        )
+        self.chat = chatview.ChatView(chat_frame)
         self.chat.grid(row=0, column=0, sticky="nsew")
-        scrollbar = ttk.Scrollbar(
-            chat_frame,
-            command=self.chat.yview,
-            style="Jarvis.Vertical.TScrollbar",
-        )
-        scrollbar.grid(row=0, column=1, sticky="ns", padx=(6, 0))
-        self.chat.configure(yscrollcommand=scrollbar.set)
-        self.chat.tag_configure(
-            "user", foreground=theme.USER, font=("Segoe UI Semibold", 10),
-            spacing1=10, spacing3=2,
-        )
-        self.chat.tag_configure("assistant", foreground=theme.TEXT, spacing1=8, spacing3=6)
-        self.chat.tag_configure("tool", foreground=theme.TOOL, font=theme.FONT_MONO)
-        self.chat.tag_configure("result", foreground=theme.RESULT, font=theme.FONT_MONO)
-        self.chat.tag_configure("warn", foreground=theme.WARN)
-        self.chat.tag_configure("error", foreground=theme.ERROR)
 
         # -- поле ввода ----------------------------------------------------
-        bottom = tk.Frame(self.root, bg=theme.BG, padx=12, pady=8)
+        bottom = tk.Frame(self.root, bg=theme.BG, padx=14, pady=12)
         bottom.grid(row=2, column=0, sticky="ew")
         bottom.columnconfigure(0, weight=1)
 
         entry_wrap = tk.Frame(
             bottom, bg=theme.INPUT_BG, highlightthickness=1,
-            highlightbackground=theme.BORDER, highlightcolor=theme.ACCENT_DIM,
+            highlightbackground=theme.blend(theme.BORDER, theme.ACCENT, 0.35),
+            highlightcolor=theme.ACCENT,
         )
         entry_wrap.grid(row=0, column=0, sticky="ew")
         entry_wrap.columnconfigure(0, weight=1)
@@ -592,18 +590,20 @@ class JarvisApp:
         self.entry = tk.Entry(
             entry_wrap,
             textvariable=self.input_var,
-            font=theme.FONT,
+            font=("Segoe UI", 11),
             bg=theme.INPUT_BG,
             fg=theme.TEXT,
-            insertbackground=theme.ACCENT,
+            insertbackground=theme.CYAN,
             bd=0,
             relief="flat",
             highlightthickness=0,
         )
-        self.entry.grid(row=0, column=0, sticky="ew", padx=12, pady=9)
+        self.entry.grid(row=0, column=0, sticky="ew", padx=16, pady=13)
         self.entry.bind("<Return>", lambda _event: self.send())
-        self.send_btn = theme.button(bottom, "Отправить ➤", self.send, accent=True)
-        self.send_btn.grid(row=0, column=1, padx=(8, 0), ipady=4)
+        self.send_btn = theme.CircleButton(
+            bottom, "➤", self.send, size=44, accent=True, bg=theme.BG
+        )
+        self.send_btn.grid(row=0, column=1, padx=(10, 0))
 
         # -- статус --------------------------------------------------------
         self.status_var = tk.StringVar(value="Готов.")
@@ -614,8 +614,8 @@ class JarvisApp:
             bg=theme.PANEL,
             fg=theme.MUTED,
             font=theme.FONT_SMALL,
-            padx=12,
-            pady=4,
+            padx=18,
+            pady=7,
         )
         status.grid(row=3, column=0, sticky="ew")
 
@@ -628,25 +628,51 @@ class JarvisApp:
 
     # -- логотип-реактор ---------------------------------------------------
     def _draw_logo(self) -> None:
+        """Реактор в шапке: ядро, орбиты и вращающиеся спутники."""
         import math
 
         canvas = self.logo
         canvas.delete("all")
-        self._logo_phase = (self._logo_phase + 0.12) % (2 * math.pi)
-        pulse = 0.5 + 0.5 * math.sin(self._logo_phase)
-        cx = cy = 17
-        for ring in (15, 11):
-            color = theme.blend(theme.ACCENT_DARK, theme.ACCENT, 0.3 + 0.4 * pulse)
+        self._logo_phase = (self._logo_phase + 0.10) % (2 * math.pi)
+        phase = self._logo_phase
+        pulse = 0.5 + 0.5 * math.sin(phase)
+        cx = cy = 22
+
+        # мягкое свечение
+        for i in range(6, 0, -1):
+            r = 12 + i * 2.2
             canvas.create_oval(
-                cx - ring, cy - ring, cx + ring, cy + ring, outline=color, width=1
+                cx - r, cy - r, cx + r, cy + r,
+                outline=theme.blend(theme.PANEL, theme.ACCENT, 0.035 * (7 - i)), width=1,
             )
+        # две орбиты-эллипса
+        for tilt, color, width in ((0.55, theme.ACCENT, 1), (0.30, theme.CYAN, 1)):
+            rx, ry = 19, 19 * tilt
+            canvas.create_oval(
+                cx - rx, cy - ry, cx + rx, cy + ry,
+                outline=theme.blend(theme.PANEL, color, 0.45 + 0.3 * pulse), width=width,
+            )
+        # спутники на орбитах
+        for speed, radius, tilt, color in (
+            (1.0, 19, 0.55, theme.CYAN),
+            (-1.6, 19, 0.30, theme.MAGENTA),
+        ):
+            angle = phase * speed
+            sx = cx + radius * math.cos(angle)
+            sy = cy + radius * tilt * math.sin(angle)
+            canvas.create_oval(
+                sx - 2, sy - 2, sx + 2, sy + 2,
+                fill=theme.blend(color, "#ffffff", 0.35), outline="",
+            )
+        # ядро
+        core_r = 6 + 1.2 * pulse
         canvas.create_oval(
-            cx - 6, cy - 6, cx + 6, cy + 6,
-            outline=theme.blend(theme.ACCENT, "#ffffff", 0.3 * pulse), width=2,
+            cx - core_r, cy - core_r, cx + core_r, cy + core_r,
+            fill=theme.blend(theme.ACCENT, theme.CYAN, 0.5 + 0.3 * pulse), outline="",
         )
         canvas.create_oval(
-            cx - 2, cy - 2, cx + 2, cy + 2,
-            fill=theme.blend(theme.ACCENT, "#ffffff", 0.4 + 0.4 * pulse), outline="",
+            cx - 2.5, cy - 2.5, cx + 2.5, cy + 2.5,
+            fill=theme.blend(theme.CYAN, "#ffffff", 0.5 + 0.4 * pulse), outline="",
         )
         self._logo_job = self.root.after(60, self._draw_logo)
 
@@ -685,10 +711,12 @@ class JarvisApp:
         self.send()
 
     def _append(self, tag: str, text: str) -> None:
-        self.chat.configure(state="normal")
-        self.chat.insert("end", text + "\n", tag)
-        self.chat.see("end")
-        self.chat.configure(state="disabled")
+        """Добавить сообщение в космическую ленту (пузыри, аватары, звёзды)."""
+        text = (text or "").strip()
+        for prefix in ("Вы: ", "JARVIS: ", "⚙ ", "↳ ", "! "):
+            if text.startswith(prefix):
+                text = text[len(prefix):]
+        self.chat.add(tag, text)
 
     def _refresh_model_label(self) -> None:
         model = str(self.settings.get("model", "")) or "модель не выбрана"
@@ -732,7 +760,7 @@ class JarvisApp:
         left = ttk.Frame(win, padding=(8, 8, 4, 8))
         left.grid(row=0, column=0, sticky="ns")
         left.rowconfigure(0, weight=1)
-        listbox = tk.Listbox(left, width=30, height=20)
+        listbox = theme.listbox(left, width=30, height=20)
         listbox.grid(row=0, column=0, sticky="ns")
 
         right = ttk.Frame(win, padding=(4, 8, 8, 8))
@@ -742,7 +770,7 @@ class JarvisApp:
         preview = tk.Text(right, wrap="word", font=("Consolas", 9), state="disabled")
         preview.grid(row=0, column=0, sticky="nsew")
 
-        status = ttk.Label(win, text=str(workspace.folder()), foreground="#666")
+        status = ttk.Label(win, text=str(workspace.folder()), foreground=theme.MUTED)
         status.grid(row=1, column=0, columnspan=2, sticky="w", padx=10)
 
         buttons = ttk.Frame(win, padding=(8, 0, 8, 8))
@@ -889,9 +917,7 @@ class JarvisApp:
         self.agent.reset()
         self.session_id = chatstore.ChatStore.new_id()
         self.session_title = ""
-        self.chat.configure(state="normal")
-        self.chat.delete("1.0", "end")
-        self.chat.configure(state="disabled")
+        self.chat.clear()
         self._append("assistant", "Новый диалог. Чем помочь?")
         self.status_var.set("Новый диалог.")
 
@@ -942,9 +968,7 @@ class JarvisApp:
         return "" if content is None else str(content)
 
     def _render_history(self, messages: list[dict[str, Any]]) -> None:
-        self.chat.configure(state="normal")
-        self.chat.delete("1.0", "end")
-        self.chat.configure(state="disabled")
+        self.chat.clear()
         for message in messages:
             role = message.get("role")
             text = self._content_text(message.get("content"))

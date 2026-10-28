@@ -765,28 +765,41 @@ class Agent:
             headers["Authorization"] = f"Bearer {key}"
         return headers
 
+    # Коды, при которых провайдер просто перегружен: имеет смысл подождать.
+    RETRY_STATUS = frozenset({408, 409, 425, 429, 500, 502, 503, 504})
+
     def _post(self, payload: dict[str, Any]) -> dict[str, Any]:
         response = None
         last_error: Exception | None = None
-        attempts = 3
+        attempts = 5
         for attempt in range(attempts):
             try:
                 response = self._session.post(
                     self._endpoint(),
                     headers=self._headers(),
                     json=payload,
-                    timeout=(10, 90),
+                    timeout=(10, 120),
                 )
-                break
             except requests.Timeout as exc:
+                if attempt < attempts - 1:
+                    time.sleep(2.0 * (attempt + 1))
+                    continue
                 raise LLMError(
-                    "Модель не ответила за 90 секунд. "
+                    "Модель не ответила за 120 секунд. "
                     "Выберите другую модель в настройках."
                 ) from exc
             except requests.RequestException as exc:
                 last_error = exc
                 if attempt < attempts - 1:
                     time.sleep(1.5 * (attempt + 1))
+                continue
+
+            if response.status_code in self.RETRY_STATUS and attempt < attempts - 1:
+                # 503 у бесплатных моделей = «очередь переполнена», ждём и пробуем снова.
+                time.sleep(min(2.0 * (attempt + 1), 8.0))
+                continue
+            break
+
         if response is None:
             raise LLMError(f"Сеть недоступна: {last_error}") from last_error
 
@@ -796,6 +809,12 @@ class Agent:
             raise LLMError(
                 "404 — неверный Base URL или модель. "
                 "Для Ollama адрес: http://localhost:11434/v1"
+            )
+        if response.status_code == 503:
+            raise LLMError(
+                "503 — бесплатная очередь модели переполнена. "
+                "Подождите минуту или выберите другую модель в настройках "
+                "(например deepseek-ai/deepseek-v4-flash)."
             )
         if response.status_code >= 400:
             raise LLMError(f"HTTP {response.status_code}: {response.text[:400]}")
